@@ -1,0 +1,159 @@
+ROLE
+You are a senior ML engineer and biomedical-AI researcher. Build a fully
+reproducible, end-to-end benchmarking framework for Alzheimer's Disease (AD)
+detection: 5 modalities x 10 algorithms = 50 unimodal pipelines, plus
+multimodal fusion for the final prediction.
+
+TASK
+Binary classification: AD (1) vs Non-AD (0).
+Config switch: label_policy: {exclude_mci | mci_as_nonad}.
+Modalities: MRI, PET, Clinical, EEG, CSF_GEN (CSF biomarkers + genetics).
+Never present synthetic or pseudo-paired results as real clinical findings.
+
+STEP 0: DATA DISCOVERY (do this first, before any modelling)
+Inspect each source and print a data report (shapes, columns, label counts,
+missingness, subject-ID format) and ask me before assuming anything unclear.
+
+Sources:
+1. MRI, PET, Clinical: clone
+   https://github.com/raj-1807/NeuroFusion-Alzheimer-s-Disease-Detection.git
+   Inspect the repo first. Report which of MRI/PET/Clinical it actually
+   contains (raw scans, preprocessed arrays, or tabular CSVs), the label
+   column, the subject-ID column, and any existing preprocessing or models
+   I can reuse. Do not assume the layout; read it.
+2. EEG: download in code with
+     import kagglehub
+     path = kagglehub.dataset_download("codingyodha/largest-alzheimer-eeg-dataset")
+   Inspect the downloaded files: format (.set/.edf/.csv/.npy), sampling rate,
+   channels, subject IDs, label definition (AD vs CN vs other, e.g. FTD).
+   Map to binary AD vs Non-AD and document the mapping.
+3. CSF_GEN: file at <CSF_PATH> = investigator_fcsf_nacc75.csv (NACC data).
+   Verified facts about this file:
+   - 3,039 rows, 2,205 unique NACCID, 23 columns.
+   - Biomarkers: CSFABETA, CSFPTAU, CSFTTAU. Other columns are assay
+     dates (CSF*MO/DY/YR) and method codes (CSF*MD, CSF*MDX).
+   - NO diagnosis label and NO genetics in this file.
+   - Value -4 is a missing-data code (300 in CSFPTAU, 154 in CSFTTAU).
+   - Values are capped (CSFABETA max 2000, CSFTTAU max 2500).
+   - Multiple visits per subject; assay platforms are mixed
+     (Lumipulse, ELISA/other), so scales differ by platform.
+   Required handling:
+   - Replace -4 (and other NACC missing codes) with NaN; add missing-indicator
+     features.
+   - Merge diagnosis from the NACC UDS clinical file on NACCID (path in
+     config: nacc_uds_path). Derive AD vs Non-AD from the UDS diagnosis
+     fields; verify field names against the NACC data dictionary. Ask me
+     if that file is not provided.
+   - Keep one baseline (earliest) CSF row per subject for the main
+     experiment, or keep all rows but group every split by NACCID.
+   - Use the platform code (CSFABMD etc.) as a categorical covariate and/or
+     standardize within platform. Treat capped values as censored.
+   - Features: ABETA, PTAU, TTAU, PTAU/ABETA, TTAU/ABETA, PTAU/TTAU,
+     log transforms, platform one-hot, missing flags.
+   - Genetics: add APOE4 allele count and optional SNPs / polygenic score
+     ONLY if I provide a genotype file (genetics_path). If absent, run
+     CSF_GEN as CSF-only and say so clearly in logs and the README.
+   - Drop assay date columns as model features (not biological signal).
+
+STEP 0b: SUBJECT LINKAGE (critical, make it a config switch)
+The four sources come from different cohorts, so the same person is
+usually NOT present in every modality. Implement
+  linkage_mode: {true_id | pseudo_pair}
+- true_id: inner-join on a shared subject ID. Report the overlap size per
+  modality combination. Use this whenever overlap is adequate.
+- pseudo_pair: build "virtual subjects" by pairing random samples of the
+  same class (AD with AD, Non-AD with Non-AD) across modalities, with a
+  fixed seed. Pair AFTER the subject-level train/test split, within each
+  split, so no real subject crosses a split. Print a prominent warning that
+  pseudo-paired fusion results demonstrate the method only, are NOT
+  clinical evidence, and are inflated by construction because the class
+  label is shared across modalities.
+- Always also report unimodal results on each modality's FULL native dataset
+  (no pairing), because these are the trustworthy numbers.
+
+STAGE 1: PROJECT STRUCTURE
+  configs/  data/  src/{preprocess,models,fusion,train,eval,explain}/
+  results/  notebooks/  requirements.txt  run_all.py  README.md
+One YAML config holds: seed, folds, epochs, lr, all paths, label_policy,
+linkage_mode, smoke_test flag. No hard-coded paths.
+
+STAGE 2: PREPROCESSING (complete code)
+- MRI: skull-strip/normalize to MNI, resample to 96x96x96 (or 2D slices),
+  intensity normalization, augmentation. If the repo already provides
+  preprocessed arrays, reuse them and document it.
+- PET: co-register to MRI, SUVR (cerebellum reference), same resizing.
+- Clinical: MMSE, CDR, ADAS-Cog, age, sex, education etc. Impute
+  (median/KNN), scale, encode. EXCLUDE every label-leaking feature (the
+  diagnosis itself and diagnosis-derived fields, e.g. CDR-based group labels
+  if they define the label). List the excluded columns in the log.
+- EEG: band-pass 0.5-45 Hz, notch, ICA artifact removal, epoching; features
+  (band power, spectral entropy, coherence) AND raw epochs for deep models.
+  Split by subject, never by epoch.
+- CSF_GEN: as specified in Step 0.
+
+STAGE 3: 10 ALGORITHMS PER MODALITY (complete working code each)
+MRI:      3D-CNN, 3D-ResNet18, 3D-DenseNet, EfficientNet-2D (slices),
+          VGG16 transfer, ViT, Swin/3D-ViT, Autoencoder+SVM,
+          Radiomics/FreeSurfer volumes+RandomForest, Siamese/Capsule net
+PET:      3D-CNN, 3D-ResNet18, 3D-DenseNet, EfficientNet-2D, VGG16 transfer,
+          ViT, Swin/3D-ViT, Autoencoder+SVM, SUVR-ROI+XGBoost, Siamese/Capsule
+Clinical: LogReg, SVM, KNN, RandomForest, XGBoost, LightGBM, CatBoost, MLP,
+          TabNet, FT-Transformer
+EEG:      Band-power+SVM, CSP+LDA, RandomForest, 1D-CNN, EEGNet, LSTM,
+          BiLSTM, CNN-LSTM, Transformer, GNN (connectivity graph)
+CSF_GEN:  L1-LogReg, ElasticNet, SVM, RandomForest, XGBoost, MLP, 1D-CNN,
+          Autoencoder+classifier, GNN, TabNet/Transformer
+Common interface for all 50:
+  build_model(cfg) -> fit(train, val) -> predict_proba(test) -> save(path)
+predict_proba returns P(AD). Deep models: one sigmoid output,
+BCEWithLogitsLoss with pos_weight. PyTorch for deep models;
+scikit-learn/XGBoost/LightGBM/CatBoost for classical ones.
+
+STAGE 4: TRAINING & EVALUATION (identical for all 50)
+- Subject-level, group-aware stratified 5-fold CV plus a held-out test set;
+  fixed seed. Use StratifiedGroupKFold on subject ID.
+- Optuna tuning inside training folds only.
+- Class imbalance: class weights/SMOTE on train only.
+- Scalers/imputers/feature selection fit on train folds only.
+- Threshold chosen on validation data only (Youden's J); also report at 0.5.
+- Metrics: Accuracy, Balanced Acc, Precision, Sensitivity, Specificity, F1,
+  AUC-ROC, AUPRC, MCC, Brier, confusion matrix, ECE + reliability diagram.
+- Mean +/- std across folds. Save out-of-fold P(AD) and embeddings.
+- Log training time, parameter count, inference time.
+
+STAGE 5: FUSION (from stored out-of-fold outputs)
+a) Early: concatenate features/embeddings -> classifier
+b) Late: average, weighted average, majority vote, max
+c) Stacking: LogReg/XGBoost meta-learner on unimodal P(AD)
+d) Intermediate: embedding concat+MLP, cross-modal attention, gated fusion
+e) Top-1 per modality, and top-3 per modality
+Also: modality ablation and missing-modality robustness (random dropout at
+test time). Do NOT enumerate all 10^5 combinations; use best-per-modality
+plus a random-sample baseline. Choose "best per modality" from validation/OOF
+results only, never the test set. Run every fusion experiment under the
+configured linkage_mode and label results with it.
+
+STAGE 6: COMPARISON & EXPLAINABILITY
+- Leaderboard of 50 pipelines (CSV + LaTeX), ranked by AUC and F1.
+- Plots: ROC/PR curves, per-modality bars, fold box plots, model x metric
+  heatmap, fusion vs unimodal.
+- Stats: Friedman + Nemenyi; paired Wilcoxon; DeLong for AUC.
+- Explainability: Grad-CAM (MRI/PET), SHAP (Clinical, CSF_GEN), saliency/
+  attention (EEG), modality contribution in the fusion model.
+
+OUTPUT FORMAT
+Deliver in parts; after each part stop and wait for me to say "next":
+  Part 1: data discovery script + data report (repo, Kaggle EEG, CSF file),
+          folder tree, YAML config, requirements, common model interface
+  Part 2: preprocessing for all 5 modalities + linkage logic
+  Part 3: Clinical + CSF_GEN (20 models)
+  Part 4: EEG (10 models)
+  Part 5: MRI (10 models)
+  Part 6: PET (10 models)
+  Part 7: training/CV/evaluation engine
+  Part 8: fusion methods
+  Part 9: comparison, statistics, plots, explainability, run_all.py, README
+Code must be runnable, commented, type-hinted, with fixed seeds. Flag every
+assumption. Include a smoke-test mode (tiny data, 1 epoch) that runs in
+minutes. If a dataset is missing, use a clearly labelled synthetic generator
+with matching shapes and mark all its outputs "SYNTHETIC".
